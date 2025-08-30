@@ -1,5 +1,7 @@
 tmp/*
 !tmp/.gitkeep
+vectorized/*
+!vectorized/.gitkeep
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
