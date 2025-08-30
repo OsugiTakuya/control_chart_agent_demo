@@ -290,10 +290,10 @@ def main(chat_dir: str, code_dir: str, out_dir: str, emb_backend: str, hf_model:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--chat_dir", type=str, default="source/chat_mode", help="chat mode source dir"
+        "--chat_dir", type=str, default="data/source_text/chat_mode", help="chat mode source dir"
     )
     parser.add_argument(
-        "--code_dir", type=str, default="source/code_mode", help="code mode source dir"
+        "--code_dir", type=str, default="data/source_text/code_mode", help="code mode source dir"
     )
     parser.add_argument(
         "--out_dir", type=str, default="vectorized", help="output dir for vector stores"

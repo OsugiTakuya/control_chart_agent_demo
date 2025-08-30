@@ -1,5 +1,3 @@
-import contextlib
-import io
 import os
 import re
 import subprocess
@@ -54,11 +52,6 @@ AGENT_CONFIG = {
 
 
 def get_llm(agent: str, temperature: float = 0.2):
-    """
-    agent名に応じた LLM インスタンスを返す。
-    - Azure 環境変数が揃っていれば Azure を使用（デプロイ名はエージェントごとに切替）
-    - それ以外は OpenAI API を使用
-    """
     cfg = AGENT_CONFIG[agent]
     model = cfg["model"]
     azure_deployment = cfg["azure_deployment"]
@@ -76,8 +69,83 @@ def get_llm(agent: str, temperature: float = 0.2):
             temperature=temperature,
         )
 
-    # 通常の OpenAI API
     return ChatOpenAI(model=model, temperature=temperature)
+
+
+# =========================
+# デフォルトの agent system prompts
+# =========================
+DEFAULT_AGENT_PROMPTS = {
+    "router": (
+        "あなたは入力が『通常の会話か/コードを書いて実行して結果を返すべきか』を判定する分類器です。"
+        "データ加工・計算・グラフ作成・シミュレーションなど、明らかに実行結果が必要な場合は run_code=True。"
+        "一般的なQA、考察、要約、ガイドは run_code=False とする。"
+    ),
+    "planner": (
+        "あなたはプランナーです。ユーザ要求を満たすための実行計画を立てます。"
+        "計画は必ず Python で実行可能な具体的な処理ステップとして、短い文のリストに分解してください。"
+        "分解した各命令に対し、それぞれ独立した.pyファイルを作成して実行結果を取得することになります。"
+        "外部ネットワークは行わないでください。"
+    ),
+    "executor_1": (
+        "あなたはPythonコーダです。以下の『処理ステップ』を満たす最小の実行可能なPythonコードを"
+        "1つのコードブロックだけで出力してください。表示は print を用いてください。"
+        "外部ネットワークにはアクセスしないでください。"
+        "\n\n"
+        "重要（図の保存について）:\n"
+        "- もし図 (plot, figure, chart) を作るなら、必ず matplotlib 等の savefig を使って"
+        "  **'{image_path_str}'** に保存してください（絶対パス）。\n"
+        "- 保存した直後に、標準出力に以下の1行を必ず出力してください:"
+        "  IMAGE_SAVED: {image_path_str}\n"
+        "- 画像保存後は plt.close() を呼んでください。\n"
+        "- ファイル書き込みが不要な処理（単純な計算やテキスト出力）なら、通常通り print で結果を出してください。"
+        "コードは1つのコードブロックに入れてください。"
+    ),
+    "executor_2": "これまでの実行ログ:\n{previous_execs_text}",
+    "summarizer_1": (
+        "あなたはサマライザです。以下の実行ログを読み、ユーザの要求に対する結果を簡潔に日本語でまとめてください。"
+        "必要なら実行値を引用してください。"
+    ),
+    "summarizer_2": "元の要求: {user_input}",
+    "responder_chat": (
+        "あなたは有能なアシスタントです。ユーザの質問に対して、"
+        "与えられた情報（直近の会話コンテキストを参考に）を元に、日本語で分かりやすく簡潔に回答してください。"
+        "必要なら箇条書きや具体例を用いて説明してください。出典提示は不要です。"
+    ),
+    "responder_code_1": (
+        "あなたは回答者です。ユーザの質問に対して、"
+        "与えられた情報（直近の会話コンテキストを参考に）を元に、日本語で分かりやすく簡潔に回答してください。"
+        "必要なら箇条書きや具体例を用いて説明してください。出典提示は不要です。"
+        "余計なメタ情報（実行ステップの詳細やソースコード等）は含めず、必要な部分だけ簡潔に伝えてください。"
+    ),
+    "responder_code_2": "# ユーザの質問:\n{user_input}\n\n# 分析結果:\n{summarizer_answer}",
+}
+
+
+class RouterDecision(BaseModel):
+    """Routerエージェントの出力"""
+
+    run_code: bool = Field(
+        description="True if the user requests writing AND executing code to produce outputs; False for normal conversation / explanation."
+    )
+    reason: str = Field(description="Short reason for the decision in Japanese.")
+
+
+class Plan(BaseModel):
+    """Plannerエージェントの出力"""
+
+    steps: List[str] = Field(
+        description="Pythonで実行する具体的な処理を短い文で表現",
+        min_items=1,
+        max_items=3,
+    )
+
+
+# =========================
+# セッションプロンプト初期化ヘルパ
+# =========================
+if "agent_prompts" not in st.session_state:
+    st.session_state.agent_prompts = DEFAULT_AGENT_PROMPTS.copy()
 
 
 # =========================
@@ -91,10 +159,6 @@ def get_web_search_tool():
 # ヘルパ: 最近の最小限の会話履歴を作成
 # =========================
 def get_recent_turn_messages(max_turns: int = 2) -> List[Any]:
-    """
-    セッション履歴(st.session_state.history)から直近の user/assistant のやり取りを
-    HumanMessage / AIMessage のリストで返す。各 invoke に渡す最小限のコンテキストとして利用する。
-    """
     messages: List[Any] = []
     hist = st.session_state.get("history", [])
     if not hist:
@@ -112,18 +176,6 @@ def get_recent_turn_messages(max_turns: int = 2) -> List[Any]:
 
 
 # =========================
-# ルータ出力 (Structured)
-# =========================
-class RouterDecision(BaseModel):
-    """ユーザ指示が 'コードを実行して結果を返す' 種かどうかの分類"""
-
-    run_code: bool = Field(
-        description="True if the user requests writing AND executing code to produce outputs; False for normal conversation / explanation."
-    )
-    reason: str = Field(description="Short reason for the decision in Japanese.")
-
-
-# =========================
 # LangGraph の State 定義
 # =========================
 class AppState(TypedDict):
@@ -136,22 +188,12 @@ class AppState(TypedDict):
 
 
 # =========================
-# ノード実装
-# =========================
-
-
+# ノード実装（各所で session の agent_prompts を参照）
 def router_node(state: AppState) -> AppState:
-    """ユーザ指示が通常会話か、コード実行が必要かを判定"""
     llm = get_llm("router", temperature=0.0)
-    system = SystemMessage(
-        content=(
-            "あなたは入力が『通常の会話か/コードを書いて実行して結果を返すべきか』を判定する分類器です。"
-            "データ加工・計算・グラフ作成・シミュレーションなど、明らかに実行結果が必要な場合は run_code=True。"
-            "一般的なQA、考察、要約、ガイドは run_code=False とする。"
-        )
-    )
+    system_content = st.session_state.agent_prompts.get("router", DEFAULT_AGENT_PROMPTS["router"])
+    system = SystemMessage(content=system_content)
 
-    # 最小限の履歴（直近の turn を最大2つまで）を渡す
     recent_msgs = get_recent_turn_messages(max_turns=2)
     messages = [system] + recent_msgs + [HumanMessage(content=state["user_input"])]
 
@@ -166,40 +208,14 @@ def router_node(state: AppState) -> AppState:
 
 
 class SearchQueries(BaseModel):
-    """検索クエリ候補。検索不要な場合は空リストにする。"""
-
-    queries: List[str] = Field(
-        description="DuckDuckGoで検索する短いクエリ。検索不要なら空リスト。",
-        min_items=0,
-        max_items=3,
-    )
-
-
-class Plan(BaseModel):
-    """ユーザ要求を満たすための具体的な処理手順"""
-
-    steps: List[str] = Field(
-        description="Pythonで実行する具体的な処理を短い文で表現",
-        min_items=1,
-        max_items=3,
-    )
+    queries: List[str] = Field(min_items=0, max_items=3)
 
 
 def planner_node(state: AppState) -> AppState:
-    """コード実行が必要な場合の計画立案（structured output版）"""
     llm = get_llm("planner", temperature=0.2)
+    system_content = st.session_state.agent_prompts.get("planner", DEFAULT_AGENT_PROMPTS["planner"])
+    system = SystemMessage(content=system_content)
 
-    system = SystemMessage(
-        content=(
-            "あなたはプランナーです。ユーザ要求を満たすための実行計画を立てます。"
-            "計画は必ず Python で実行可能な具体的な処理ステップとして、"
-            "短い文のリストに分解してください。"
-            "分解した各命令に対し、それぞれ独立した.pyファイルを作成して実行結果を取得することになります。"
-            "外部ネットワークやファイル書込は行わないでください。"
-        )
-    )
-
-    # planner に渡す履歴は非常に短く（過去1ターン程度）
     recent_msgs = get_recent_turn_messages(max_turns=1)
     decision: Plan = llm.with_structured_output(Plan).invoke(
         [system] + recent_msgs + [HumanMessage(content=state["user_input"])]
@@ -212,7 +228,6 @@ def planner_node(state: AppState) -> AppState:
 
 
 def _extract_code_blocks(text: str) -> List[str]:
-    """```python ... ``` のコードブロックを抽出。なければ全文を1ブロック扱い"""
     blocks = re.findall(r"```(?:python)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
     if blocks:
         return [b.strip() for b in blocks if b.strip()]
@@ -222,39 +237,37 @@ def _extract_code_blocks(text: str) -> List[str]:
 def executor_node(
     state: AppState, ui_callback: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> AppState:
-    """実行者：各ステップをPythonコード化し、/tmp/ にファイルを作って実行
-
-    ui_callback が渡された場合、各ステップの実行レポートを即座にUIに渡す。
-    """
     llm = get_llm("executor", temperature=0.0)
     executions: List[str] = []
+    images_accum: List[str] = []
 
     tmp_dir = Path("tmp")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     for i, step in enumerate(state.get("plan", []) or [], start=1):
-        # ステップを Python コード化
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "あなたはPythonコーダです。以下の『処理ステップ』を満たす最小の実行可能なPythonコードを"
-                    "1つのコードブロックだけで出力してください。表示は print を用いてください。"
-                    "外部ネットワークやファイルの書き込みはしないでください。",
-                ),
-                ("human", "{step}"),
-            ]
-        )
+        image_path = (tmp_dir / f"step_{i}.png").resolve()
+        image_path_str = str(image_path)
 
-        # executor に渡す履歴: これまでの実行結果（あれば）と簡潔な会話履歴
+        # ユーザ編集の executor プロンプト（ベース）を取得し、画像保存に関する「動的ルール」を追記する
+        user_executor_prompt_base = st.session_state.agent_prompts.get(
+            "executor_1", DEFAULT_AGENT_PROMPTS["executor_1"]
+        )
+        system_content = user_executor_prompt_base.format(image_path_str=image_path_str)
+
+        # ChatPromptTemplate を用意（system + human）
+        prompt = ChatPromptTemplate.from_messages([("system", system_content), ("human", "{step}")])
+
         recent_msgs = get_recent_turn_messages(max_turns=1)
         previous_execs_text = "\n\n".join(executions) if executions else ""
         extra_msgs: List[Any] = []
         if previous_execs_text:
-            # 前段の実行ログを渡し、次のステップでの整合性を保つ
-            extra_msgs.append(HumanMessage(content=f"これまでの実行ログ:\n{previous_execs_text}"))
+            system_content = st.session_state.agent_prompts.get(
+                "executor_2", DEFAULT_AGENT_PROMPTS["executor_2"]
+            )
+            extra_msgs.append(
+                HumanMessage(content=system_content.format(previous_execs_text=previous_execs_text))
+            )
 
-        # 最小限のメッセージ列を作成
         prompt_msgs = prompt.format_messages(step=step)
         messages = (
             [SystemMessage(content=prompt_msgs[0].content)]
@@ -262,15 +275,7 @@ def executor_node(
             else []
         )
         messages = (
-            [
-                SystemMessage(
-                    content=(
-                        "あなたはPythonコーダです。以下の『処理ステップ』を満たす最小の実行可能なPythonコードを"
-                        "1つのコードブロックだけで出力してください。表示は print を用いてください。"
-                        "外部ネットワークやファイルの書き込みはしないでください。"
-                    )
-                )
-            ]
+            [SystemMessage(content=prompt_msgs[0].content)]
             + recent_msgs
             + extra_msgs
             + [HumanMessage(content=step)]
@@ -288,108 +293,120 @@ def executor_node(
 
         code = code_blocks[0]
 
-        # ファイル書き出し
         file_path = tmp_dir / f"step_{i}.py"
         file_path.write_text(code, encoding="utf-8")
 
-        # サブプロセスで実行
+        prior_files = set(tmp_dir.iterdir())
+
         try:
             result = subprocess.run(
                 [sys.executable, str(file_path)],
                 capture_output=True,
                 text=True,
-                timeout=20,
+                timeout=40,
             )
             out = result.stdout.strip() or "(no output)"
             err = result.stderr.strip()
-            exec_report = f"[Step {i}] OK\n--- file ---\n{file_path}\n--- code ---\n{code}\n--- output ---\n{out}"
+            exec_report_str = f"[Step {i}] OK\n--- file ---\n{file_path}\n--- code ---\n{code}\n--- output ---\n{out}"
             if err:
-                exec_report += f"\n--- stderr ---\n{err}"
+                exec_report_str += f"\n--- stderr ---\n{err}"
         except Exception as e:
-            exec_report = (
+            out = ""
+            err = str(e)
+            exec_report_str = (
                 f"[Step {i}] 実行エラー: {e}\n--- file ---\n{file_path}\n--- code ---\n{code}"
             )
 
-        executions.append(exec_report)
+        images: List[str] = []
+        try:
+            marker_matches = re.findall(r"IMAGE_SAVED:\s*(\S+)", out)
+            for m in marker_matches:
+                p = Path(m)
+                if not p.is_absolute():
+                    p = (tmp_dir / m).resolve()
+                if p.exists():
+                    images.append(str(p))
+                    images_accum.append(str(p))
+        except Exception:
+            pass
 
-        # 各ステップ完了時にUIに即時通知
+        new_files = set(tmp_dir.iterdir()) - prior_files
+        for p in sorted(new_files):
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif"}:
+                if str(p) not in images:
+                    images.append(str(p))
+                    images_accum.append(str(p))
+
+        executions.append(exec_report_str)
+
+        step_log = {"agent": f"Executor-Step-{i}", "output": exec_report_str}
+        if images:
+            step_log["images"] = images
+
         if ui_callback:
-            ui_callback({"agent": f"Executor-Step-{i}", "output": exec_report})
+            ui_callback(step_log)
 
     log = {"agent": "Executor", "output": "\n\n".join(executions)}
+    if images_accum:
+        log["images"] = images_accum
+
     return {**state, "executions": executions, "agent_logs": state["agent_logs"] + [log]}
 
 
 def summarizer_node(state: AppState) -> AppState:
-    """実行結果の要約"""
     llm = get_llm("summarizer", temperature=0.3)
     joined = "\n\n".join(state.get("executions") or [])
 
-    system = SystemMessage(
-        content=(
-            "あなたはサマライザです。以下の実行ログを読み、ユーザの要求に対する結果を簡潔に日本語でまとめてください。"
-            "必要なら実行値を引用してください。"
-        )
+    system_content = st.session_state.agent_prompts.get(
+        "summarizer_1", DEFAULT_AGENT_PROMPTS["summarizer_1"]
     )
+    system = SystemMessage(content=system_content)
 
-    # 要約には、ユーザの元の要求を念のため渡す（文脈確保）
     recent_msgs = get_recent_turn_messages(max_turns=1)
+    user_input = state.get("user_input", "").strip()
+    system_content = st.session_state.agent_prompts.get(
+        "summarizer_2", DEFAULT_AGENT_PROMPTS["summarizer_2"]
+    )
     messages = (
         [system]
         + recent_msgs
         + [
             HumanMessage(content=joined),
-            HumanMessage(content=f"元の要求: {state.get('user_input','')}"),
+            HumanMessage(content=system_content.format(user_input=user_input)),
         ]
     )
 
-    # NOTE: もしjoinedが長大になる場合は要注意（本デモでは短いはず）
     answer = llm.invoke(messages).content
     log = {"agent": "Summarizer", "output": answer}
     return {**state, "answer": answer, "agent_logs": state["agent_logs"] + [log]}
 
 
 def responder_node(state: AppState) -> AppState:
-    """
-    - chat モード: ユーザの要求（state['user_input']）を直接受けて回答を作成
-    - code モード: summarizer の要約（state['answer']）を基に回答を作成
-    モードによってシステムプロンプトと渡す内容を切り替え、生成部分は共通化する。
-    """
     mode = state.get("mode", "chat")
     generation_llm = get_llm("responder", temperature=0.3)
 
     if mode == "chat":
-        # chat 用プロンプト（シンプルなアシスタント）
-        system = SystemMessage(
-            content=(
-                "あなたは有能なアシスタントです。ユーザの質問に対して、"
-                "与えられた情報（直近の会話コンテキストを参考に）を元に、日本語で分かりやすく簡潔に回答してください。"
-                "必要なら箇条書きや具体例を用いて説明してください。"
-                "出典提示は不要です。"
-            )
+        system_content = st.session_state.agent_prompts.get(
+            "responder_chat", DEFAULT_AGENT_PROMPTS["responder_chat"]
         )
-
-        # ユーザ発話を直接渡す
+        system = SystemMessage(content=system_content)
         payload = state.get("user_input", "").strip()
         recent_msgs = get_recent_turn_messages(max_turns=3)
-
     else:
-        # code モード（summarizer -> responder）：要約を整形して最終回答にする
-        system = SystemMessage(
-            content=(
-                "あなたは回答者です。以下の要約を基に、ユーザにわかりやすく自然な日本語で最終回答を作成してください。"
-                "余計なメタ情報（実行ステップの詳細等）は含めず、必要な部分だけ簡潔に伝えてください。"
-            )
+        system_content = st.session_state.agent_prompts.get(
+            "responder_code_1", DEFAULT_AGENT_PROMPTS["responder_code_1"]
         )
+        system = SystemMessage(content=(system_content))
 
-        # summarizer の出力を渡す（state['answer'] に要約が入っている想定）
-        payload = state.get("answer", "").strip()
+        user_input = state.get("user_input", "").strip()
+        summarizer_answer = state.get("answer", "").strip()
+        system_content = st.session_state.agent_prompts.get(
+            "responder_code_2", DEFAULT_AGENT_PROMPTS["responder_code_2"]
+        )
+        payload = system_content.format(user_input=user_input, summarizer_answer=summarizer_answer)
         recent_msgs = get_recent_turn_messages(max_turns=1)
 
-    # 共通の生成ステップ
-    # system + recent context + human payload の順で渡す
     messages = [system] + recent_msgs + [HumanMessage(content=payload or "")]
-
     final_answer = generation_llm.invoke(messages).content
 
     log = {"agent": f"Responder(mode={mode})", "output": final_answer}
@@ -434,127 +451,150 @@ GRAPH = build_graph()
 
 
 # =========================
-# Streamlit UI
+# Streamlit UI (タブ化)
 # =========================
 st.set_page_config(page_title="LLM Multi-Agent Demo", page_icon="🤖", layout="centered")
-st.title("🤖 LLM Multi-Agent Demo (LangGraph + LangChain + Streamlit)")
+tabs = st.tabs(["アプリ", "詳細設定"])
+app_tab, settings_tab = tabs[0], tabs[1]
 
-# セッション永続メモリ
-if "history" not in st.session_state:
-    st.session_state.history = []  # 各ターンの state を保存
-if "thread_memory" not in st.session_state:
-    # ユーザ発話を単純に連結で持つ（必要に応じて高度なメモリに置換可）
-    st.session_state.thread_memory = []
+with app_tab:
+    st.title("🤖 LLM Multi-Agent Demo (LangGraph + LangChain + Streamlit)")
 
+    # セッション永続メモリ
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    if "thread_memory" not in st.session_state:
+        st.session_state.thread_memory = []
 
-# UI ヘルパ: エージェントログを即時表示する
-def display_agent_log(container: st.delta_generator.DeltaGenerator, log: Dict[str, Any]):
-    with container.expander(f"🧩 {log.get('agent')}"):
-        # 出力が JSON-ish な場合は st.json を使うと見やい
-        out = log.get("output")
-        notes = log.get("notes")
-        if isinstance(out, (dict, list)):
-            st.json(out)
-        else:
-            st.write(out)
-        if notes:
-            st.caption("notes:")
-            st.json(notes)
+    # UI ヘルパ: エージェントログを即時表示する
+    def display_agent_log(container: st.delta_generator.DeltaGenerator, log: Dict[str, Any]):
+        with container.expander(f"🧩 {log.get('agent')}"):
+            out = log.get("output")
+            notes = log.get("notes")
+            if isinstance(out, (dict, list)):
+                st.json(out)
+            else:
+                st.write(out)
+            if notes:
+                st.caption("notes:")
+                st.json(notes)
 
+    def run_graph_stepwise(
+        init_state: AppState, ui_container: st.delta_generator.DeltaGenerator
+    ) -> AppState:
+        state = init_state
 
-# ステップ実行関数: 各ノードが終わるたびにUIに表示
-def run_graph_stepwise(
-    init_state: AppState, ui_container: st.delta_generator.DeltaGenerator
-) -> AppState:
-    state = init_state
+        # Router
+        state = router_node(state)
+        display_agent_log(ui_container, state["agent_logs"][-1])
 
-    # 1) Router
-    state = router_node(state)
-    # 最新ログを UI に表示
-    display_agent_log(ui_container, state["agent_logs"][-1])
+        if state["mode"] == "chat":
+            state = responder_node(state)
+            display_agent_log(ui_container, state["agent_logs"][-1])
+            if state.get("answer"):
+                ui_container.success(state["answer"])
+            return state
 
-    if state["mode"] == "chat":
-        # Chat モードでは responder を直接呼ぶ（search を内包）
+        # Code mode
+        state = planner_node(state)
+        display_agent_log(ui_container, state["agent_logs"][-1])
+
+        def executor_ui_callback(log: Dict[str, Any]):
+            display_agent_log(ui_container, log)
+
+        state = executor_node(state, ui_callback=executor_ui_callback)
+        # Executor 全体ログ表示
+        display_agent_log(ui_container, state["agent_logs"][-1])
+
+        state = summarizer_node(state)
+        display_agent_log(ui_container, state["agent_logs"][-1])
+
         state = responder_node(state)
         display_agent_log(ui_container, state["agent_logs"][-1])
-        # 回答があれば即時表示
+
+        executor_images: List[str] = []
+        for log in state.get("agent_logs", []):
+            imgs = log.get("images")
+            if imgs:
+                executor_images.extend(imgs)
+
         if state.get("answer"):
             ui_container.success(state["answer"])
+
+        if executor_images:
+            try:
+                ui_container.image(executor_images, use_column_width=True)
+            except Exception as e:
+                ui_container.warning(f"図の表示に失敗しました: {e}")
+
         return state
 
-    # Code mode: Planner -> Executor (per-step) -> Summarizer -> Responder
-    state = planner_node(state)
-    display_agent_log(ui_container, state["agent_logs"][-1])
+    with st.form(key="user_form", clear_on_submit=False):
+        user_input = st.text_area(
+            "指示文を入力してください",
+            height=160,
+            placeholder="例：製品○○、評価値△△の管理図をプロットして\n例：製品○○、評価値△△が異常か判定して",
+        )
+        submitted = st.form_submit_button("送信")
 
-    # Executor: 各ステップ完了時に即時 UI へ流すコールバックを渡す
-    def executor_ui_callback(log: Dict[str, Any]):
-        # 一つずつエクスパンダを作って内容を出す
-        display_agent_log(ui_container, log)
+    if submitted and user_input.strip():
+        st.session_state.thread_memory.append(user_input.strip())
 
-    state = executor_node(state, ui_callback=executor_ui_callback)
-    # Executor 全体のログ（まとめ）も表示
-    display_agent_log(ui_container, state["agent_logs"][-1])
+        init_state: AppState = {
+            "user_input": user_input.strip(),
+            "mode": "chat",
+            "plan": None,
+            "executions": None,
+            "answer": None,
+            "agent_logs": [],
+        }
 
-    state = summarizer_node(state)
-    display_agent_log(ui_container, state["agent_logs"][-1])
+        ui_container = st.container()
+        result_state: AppState = run_graph_stepwise(init_state, ui_container)
+        st.session_state.history.append(result_state)
 
-    state = responder_node(state)
-    display_agent_log(ui_container, state["agent_logs"][-1])
+    # 履歴表示
+    if st.session_state.history:
+        st.subheader("📚 セッション履歴")
+        for idx, turn in enumerate(reversed(st.session_state.history), start=1):
+            st.markdown(f"### Turn {len(st.session_state.history) - idx + 1}")
+            for log in turn.get("agent_logs", []):
+                with st.expander(f"🧩 {log.get('agent')}"):
+                    st.write(log.get("output"))
+                    if "notes" in log and log["notes"]:
+                        st.caption("notes:")
+                        st.json(log["notes"])
+            if turn.get("answer"):
+                st.success(turn["answer"])
+    else:
+        st.info("最初の指示を入力して、エージェントの実行結果を確認してください。")
 
-    if state.get("answer"):
-        ui_container.success(state["answer"])
-
-    return state
-
-
-with st.form(key="user_form", clear_on_submit=False):
-    user_input = st.text_area(
-        "指示文を入力してください",
-        height=160,
-        placeholder="例：2020〜2024の世界GDP上位5か国を一覧にして考察して\n例：πを100桁計算して先頭20桁だけ表示して",
+    st.caption(
+        "Tips: ルータがコード実行と判断すると、Planner → Executor → Summarizer の順で動きます。"
+        "通常会話と判断すると、直接 Responder が検索（必要時）を行って応答します。"
     )
-    submitted = st.form_submit_button("送信")
 
-if submitted and user_input.strip():
-    # スレッド記憶を付加（本デモではシンプルに Human の履歴を渡すだけ）
-    st.session_state.thread_memory.append(user_input.strip())
+with settings_tab:
+    st.header("🛠 詳細設定 — 各エージェントの system プロンプトを編集")
+    st.write(
+        "ここで編集した system プロンプトは、このセッション中に保存され、エージェント実行時に使用されます。"
+    )
+    st.write(
+        "※ Executor の場合、図の保存や `IMAGE_SAVED:` マーカー等の画像ルールは自動的に追記されます。"
+    )
 
-    init_state: AppState = {
-        "user_input": user_input.strip(),
-        "mode": "chat",
-        "plan": None,
-        "executions": None,
-        "answer": None,
-        "agent_logs": [],
-    }
+    cols = st.columns([1, 1])
+    with cols[0]:
+        if st.button("デフォルトに戻す"):
+            st.session_state.agent_prompts = DEFAULT_AGENT_PROMPTS.copy()
+            st.rerun()
 
-    # UI 表示領域（ここに各エージェントの expander を順次追加する）
-    ui_container = st.container()
+    # 各エージェントのプロンプト編集エリア
+    for agent in DEFAULT_AGENT_PROMPTS.keys():
+        label = f"{agent}"
+        current = st.session_state.agent_prompts.get(agent, DEFAULT_AGENT_PROMPTS[agent])
+        new_text = st.text_area(label, value=current, height=160, key=f"prompt_{agent}")
+        # 変更があればセッション状態に反映
+        st.session_state.agent_prompts[agent] = new_text
 
-    # ステップ実行（各ノード完了時に即時表示される）
-    result_state: AppState = run_graph_stepwise(init_state, ui_container)
-
-    # 履歴に保存（セッションの記憶保持）
-    st.session_state.history.append(result_state)
-
-# 履歴の表示
-if st.session_state.history:
-    st.subheader("📚 セッション履歴")
-    for idx, turn in enumerate(reversed(st.session_state.history), start=1):
-        st.markdown(f"### Turn {len(st.session_state.history) - idx + 1}")
-        for log in turn.get("agent_logs", []):
-            with st.expander(f"🧩 {log.get('agent')}"):
-                st.write(log.get("output"))
-                if "notes" in log and log["notes"]:
-                    st.caption("notes:")
-                    st.json(log["notes"])
-        if turn.get("answer"):
-            st.success(turn["answer"])
-else:
-    st.info("最初の指示を入力して、エージェントの実行結果を確認してください。")
-
-
-st.caption(
-    "Tips: ルータがコード実行と判断すると、Planner → Executor → Summarizer の順で動きます。"
-    "通常会話と判断すると、直接 Responder が検索（必要時）を行って応答します。"
-)
+    st.caption("編集後はアプリタブに戻り、通常どおり送信してください。")

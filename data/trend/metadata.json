@@ -1,0 +1,62 @@
+{
+    "dataset": "管理図作成用: 時刻・製品・パラメータごとの測定値",
+    "fields": {
+        "login_date": {
+            "type": "datetime",
+            "format": "YYYY-MM-DD HH:MM:SS",
+            "description": "データ取得日",
+            "nullable": false,
+            "example": "2025-08-01 12:31:00"
+        },
+        "product": {
+            "type": "string",
+            "description": "製品名",
+            "nullable": false,
+            "example": "製品1"
+        },
+        "parameter": {
+            "type": "string",
+            "description": "管理対象のパラメータ",
+            "nullable": false,
+            "example": "FlowRate_L_min"
+        },
+        "value": {
+            "type": "float",
+            "unit": "varies by sensor",
+            "description": "測定値",
+            "nullable": false,
+            "example": 120.5
+        },
+        "unit": {
+            "type": "string",
+            "description": "測定値の単位",
+            "nullable": false,
+            "example": "L/min"
+        },
+        "lcl": {
+            "type": "float",
+            "description": "管理下限 (Lower Control Limit)",
+            "nullable": false
+        },
+        "ucl": {
+            "type": "float",
+            "description": "管理上限 (Upper Control Limit)",
+            "nullable": false
+        },
+        "minimum": {
+            "type": "float",
+            "description": "パラメータ最小値",
+            "nullable": false
+        },
+        "maximum": {
+            "type": "float",
+            "description": "パラメータ最大値",
+            "nullable": false
+        },
+        "in_control": {
+            "type": "boolean",
+            "description": "管理内かどうか (true: 管理内, false: 管理外)",
+            "nullable": false
+        }
+    }
+}
