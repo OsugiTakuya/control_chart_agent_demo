@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -97,6 +97,30 @@ def get_web_search_tool():
 
 
 # =========================
+# ヘルパ: 最近の最小限の会話履歴を作成
+# =========================
+def get_recent_turn_messages(max_turns: int = 2) -> List[Any]:
+    """
+    セッション履歴(st.session_state.history)から直近の user/assistant のやり取りを
+    HumanMessage / AIMessage のリストで返す。各 invoke に渡す最小限のコンテキストとして利用する。
+    """
+    messages: List[Any] = []
+    hist = st.session_state.get("history", [])
+    if not hist:
+        return messages
+
+    recent = hist[-max_turns:]
+    for turn in recent:
+        u = turn.get("user_input")
+        if u:
+            messages.append(HumanMessage(content=u))
+        a = turn.get("answer")
+        if a:
+            messages.append(AIMessage(content=a))
+    return messages
+
+
+# =========================
 # ルータ出力 (Structured)
 # =========================
 class RouterDecision(BaseModel):
@@ -135,8 +159,12 @@ def router_node(state: AppState) -> AppState:
             "一般的なQA、考察、要約、ガイド、Web検索で簡潔するものは run_code=False とする。"
         )
     )
-    human = HumanMessage(content=state["user_input"])
-    decision = llm.with_structured_output(RouterDecision).invoke([system, human])
+
+    # 最小限の履歴（直近の turn を最大2つまで）を渡す
+    recent_msgs = get_recent_turn_messages(max_turns=2)
+    messages = [system] + recent_msgs + [HumanMessage(content=state["user_input"])]
+
+    decision = llm.with_structured_output(RouterDecision).invoke(messages)
     mode: Literal["chat", "code"] = "code" if decision.run_code else "chat"
     log = {"agent": "Router", "output": f"run_code={decision.run_code} / reason={decision.reason}"}
     return {
@@ -170,9 +198,11 @@ def chat_agent_node(state: AppState) -> AppState:
             "検索不要と判断した場合は空リストを返してください。"
         )
     )
-    human = HumanMessage(content=state["user_input"])
+
+    # 履歴は最近の会話のみを渡す（過去2ターンまで）
+    recent_msgs = get_recent_turn_messages(max_turns=2)
     decision: SearchQueries = planner_llm.with_structured_output(SearchQueries).invoke(
-        [system, human]
+        [system] + recent_msgs + [HumanMessage(content=state["user_input"])]
     )
 
     queries = decision.queries
@@ -186,7 +216,7 @@ def chat_agent_node(state: AppState) -> AppState:
             except Exception as e:
                 results.append(f"[{q}] 検索エラー: {e}")
 
-    # 最終回答
+    # 最終回答: 直近の会話（最大3ターン）＋検索結果を渡す（必要最小限）
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -198,12 +228,16 @@ def chat_agent_node(state: AppState) -> AppState:
             ("ai", "{snippets}"),
         ]
     )
-    answer = llm.invoke(
-        prompt.format_messages(
-            q=state["user_input"],
-            snippets="\n\n".join(results) if results else "（検索なし）",
-        )
-    ).content
+
+    base_msgs = get_recent_turn_messages(max_turns=3)
+    prompt_msgs = prompt.format_messages(
+        q=state["user_input"],
+        snippets="\n\n".join(results) if results else "（検索なし）",
+    )
+
+    # recent_msgs を前に付けて、文脈を維持しつつ冗長にならないようにする
+    answer_msgs = base_msgs + prompt_msgs
+    answer = llm.invoke(answer_msgs).content
 
     log = {
         "agent": "ChatAgent(with WebSearch)",
@@ -235,10 +269,12 @@ def planner_node(state: AppState) -> AppState:
             "外部ネットワークやファイル書込は行わないでください。"
         )
     )
-    human = HumanMessage(content=state["user_input"])
 
-    # structured_outputを使って steps を直接抽出
-    decision: Plan = llm.with_structured_output(Plan).invoke([system, human])
+    # planner に渡す履歴は非常に短く（過去1ターン程度）
+    recent_msgs = get_recent_turn_messages(max_turns=1)
+    decision: Plan = llm.with_structured_output(Plan).invoke(
+        [system] + recent_msgs + [HumanMessage(content=state["user_input"])]
+    )
 
     steps = decision.steps
     log = {"agent": "Planner", "output": "\n".join(f"- {s}" for s in steps)}
@@ -254,12 +290,18 @@ def _extract_code_blocks(text: str) -> List[str]:
     return [text.strip()] if text.strip() else []
 
 
-def executor_node(state: AppState) -> AppState:
-    """実行者：各ステップをPythonコード化し、/tmp/ にファイルを作って実行"""
+def executor_node(
+    state: AppState, ui_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+) -> AppState:
+    """実行者：各ステップをPythonコード化し、/tmp/ にファイルを作って実行
+
+    ui_callback が渡された場合、各ステップの実行レポートを即座にUIに渡す。
+    """
     llm = get_llm("executor", temperature=0.0)
     executions: List[str] = []
 
     tmp_dir = Path("tmp")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     for i, step in enumerate(state.get("plan", []) or [], start=1):
         # ステップを Python コード化
@@ -274,11 +316,45 @@ def executor_node(state: AppState) -> AppState:
                 ("human", "{step}"),
             ]
         )
-        code_text = llm.invoke(prompt.format_messages(step=step)).content
+
+        # executor に渡す履歴: これまでの実行結果（あれば）と簡潔な会話履歴
+        recent_msgs = get_recent_turn_messages(max_turns=1)
+        previous_execs_text = "\n\n".join(executions) if executions else ""
+        extra_msgs: List[Any] = []
+        if previous_execs_text:
+            # 前段の実行ログを渡し、次のステップでの整合性を保つ
+            extra_msgs.append(HumanMessage(content=f"これまでの実行ログ:\n{previous_execs_text}"))
+
+        # 最小限のメッセージ列を作成
+        prompt_msgs = prompt.format_messages(step=step)
+        messages = (
+            [SystemMessage(content=prompt_msgs[0].content)]
+            if prompt_msgs and isinstance(prompt_msgs[0], SystemMessage)
+            else []
+        )
+        messages = (
+            [
+                SystemMessage(
+                    content=(
+                        "あなたはPythonコーダです。以下の『処理ステップ』を満たす最小の実行可能なPythonコードを"
+                        "1つのコードブロックだけで出力してください。表示は print を用いてください。"
+                        "外部ネットワークやファイルの書き込みはしないでください。"
+                    )
+                )
+            ]
+            + recent_msgs
+            + extra_msgs
+            + [HumanMessage(content=step)]
+        )
+
+        code_text = llm.invoke(messages).content
         code_blocks = _extract_code_blocks(code_text)
 
         if not code_blocks:
-            executions.append(f"[Step {i}] コード生成に失敗しました。")
+            exec_report = f"[Step {i}] コード生成に失敗しました。"
+            executions.append(exec_report)
+            if ui_callback:
+                ui_callback({"agent": f"Executor-Step-{i}", "output": exec_report})
             continue
 
         code = code_blocks[0]
@@ -307,6 +383,10 @@ def executor_node(state: AppState) -> AppState:
 
         executions.append(exec_report)
 
+        # 各ステップ完了時にUIに即時通知
+        if ui_callback:
+            ui_callback({"agent": f"Executor-Step-{i}", "output": exec_report})
+
     log = {"agent": "Executor", "output": "\n\n".join(executions)}
     return {**state, "executions": executions, "agent_logs": state["agent_logs"] + [log]}
 
@@ -315,17 +395,27 @@ def summarizer_node(state: AppState) -> AppState:
     """実行結果の要約"""
     llm = get_llm("summarizer", temperature=0.3)
     joined = "\n\n".join(state.get("executions") or [])
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "あなたはサマライザです。以下の実行ログを読み、ユーザの要求に対する結果を簡潔に日本語でまとめてください。"
-                "必要なら実行値を引用してください。",
-            ),
-            ("human", "{log}"),
+
+    system = SystemMessage(
+        content=(
+            "あなたはサマライザです。以下の実行ログを読み、ユーザの要求に対する結果を簡潔に日本語でまとめてください。"
+            "必要なら実行値を引用してください。"
+        )
+    )
+
+    # 要約には、ユーザの元の要求を念のため渡す（文脈確保）
+    recent_msgs = get_recent_turn_messages(max_turns=1)
+    messages = (
+        [system]
+        + recent_msgs
+        + [
+            HumanMessage(content=joined),
+            HumanMessage(content=f"元の要求: {state.get('user_input','')}"),
         ]
     )
-    answer = llm.invoke(prompt.format_messages(log=joined)).content
+
+    # NOTE: もしjoinedが長大になる場合は要注意（本デモでは短いはず）
+    answer = llm.invoke(messages).content
     log = {"agent": "Summarizer", "output": answer}
     return {**state, "answer": answer, "agent_logs": state["agent_logs"] + [log]}
 
@@ -333,23 +423,23 @@ def summarizer_node(state: AppState) -> AppState:
 def responder_node(state: AppState) -> AppState:
     """Summarizer の要約をもとに、ユーザ向けの最終回答を自然な文章に整形"""
     llm = get_llm("summarizer", temperature=0.5)  # summarizerと同じでも良いが切替可
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "あなたは回答者です。以下の要約を基に、ユーザにわかりやすく自然な日本語で最終回答を作成してください。"
-                "余計なメタ情報（実行ステップなど）は含めず、必要な部分だけ簡潔に伝えてください。",
-            ),
-            ("human", "{summary}"),
-        ]
+    system = SystemMessage(
+        content=(
+            "あなたは回答者です。以下の要約を基に、ユーザにわかりやすく自然な日本語で最終回答を作成してください。"
+            "余計なメタ情報（実行ステップなど）は含めず、必要な部分だけ簡潔に伝えてください。"
+        )
     )
-    answer = llm.invoke(prompt.format_messages(summary=state.get("answer", ""))).content
+
+    # 最小限の履歴 + 要約を渡す
+    recent_msgs = get_recent_turn_messages(max_turns=1)
+    messages = [system] + recent_msgs + [HumanMessage(content=state.get("answer", ""))]
+    answer = llm.invoke(messages).content
     log = {"agent": "Responder", "output": answer}
     return {**state, "answer": answer, "agent_logs": state["agent_logs"] + [log]}
 
 
 # =========================
-# グラフ構築
+# グラフ構築 (既存のために残すが、今回はステップ実行のために別実装を利用)
 # =========================
 def build_graph():
     g = StateGraph(AppState)
@@ -400,6 +490,67 @@ if "thread_memory" not in st.session_state:
     # ユーザ発話を単純に連結で持つ（必要に応じて高度なメモリに置換可）
     st.session_state.thread_memory = []
 
+
+# UI ヘルパ: エージェントログを即時表示する
+def display_agent_log(container: st.delta_generator.DeltaGenerator, log: Dict[str, Any]):
+    with container.expander(f"🧩 {log.get('agent')}"):
+        # 出力が JSON-ish な場合は st.json を使うと見やすい
+        out = log.get("output")
+        notes = log.get("notes")
+        if isinstance(out, (dict, list)):
+            st.json(out)
+        else:
+            st.write(out)
+        if notes:
+            st.caption("notes:")
+            st.json(notes)
+
+
+# ステップ実行関数: 各ノードが終わるたびにUIに表示
+def run_graph_stepwise(
+    init_state: AppState, ui_container: st.delta_generator.DeltaGenerator
+) -> AppState:
+    state = init_state
+
+    # 1) Router
+    state = router_node(state)
+    # 最新ログを UI に表示
+    display_agent_log(ui_container, state["agent_logs"][-1])
+
+    if state["mode"] == "chat":
+        # Chat agent
+        state = chat_agent_node(state)
+        display_agent_log(ui_container, state["agent_logs"][-1])
+        # 回答があれば即時表示
+        if state.get("answer"):
+            ui_container.success(state["answer"])
+        return state
+
+    # Code mode: Planner -> Executor (per-step) -> Summarizer -> Responder
+    state = planner_node(state)
+    display_agent_log(ui_container, state["agent_logs"][-1])
+
+    # Executor: 各ステップ完了時に即時 UI へ流すコールバックを渡す
+    def executor_ui_callback(log: Dict[str, Any]):
+        # 一つずつエクスパンダを作って内容を出す
+        display_agent_log(ui_container, log)
+
+    state = executor_node(state, ui_callback=executor_ui_callback)
+    # Executor 全体のログ（まとめ）も表示
+    display_agent_log(ui_container, state["agent_logs"][-1])
+
+    state = summarizer_node(state)
+    display_agent_log(ui_container, state["agent_logs"][-1])
+
+    state = responder_node(state)
+    display_agent_log(ui_container, state["agent_logs"][-1])
+
+    if state.get("answer"):
+        ui_container.success(state["answer"])
+
+    return state
+
+
 with st.form(key="user_form", clear_on_submit=False):
     user_input = st.text_area(
         "指示文を入力してください",
@@ -421,8 +572,11 @@ if submitted and user_input.strip():
         "agent_logs": [],
     }
 
-    # LangGraph 実行
-    result_state: AppState = GRAPH.invoke(init_state)
+    # UI 表示領域（ここに各エージェントの expander を順次追加する）
+    ui_container = st.container()
+
+    # ステップ実行（各ノード完了時に即時表示される）
+    result_state: AppState = run_graph_stepwise(init_state, ui_container)
 
     # 履歴に保存（セッションの記憶保持）
     st.session_state.history.append(result_state)
