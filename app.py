@@ -1,9 +1,10 @@
+import datetime
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Union
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -24,7 +25,6 @@ from pydantic import BaseModel, Field
 # Env 読み込み & LLM Factory
 # =========================
 load_dotenv()
-
 
 # 各エージェント用のモデル/デプロイ設定を.envから読み込み
 AGENT_CONFIG = {
@@ -73,6 +73,44 @@ def get_llm(agent: str, temperature: float = 0.2):
 
 
 # =========================
+# ツール実装: save_similar_series_plot
+# =========================
+
+
+def save_similar_series_plot(
+    filepath: str,
+    target_time: Union[str, datetime.datetime],
+    window: int,
+    product: str,
+    parameter: str,
+) -> None:
+    """
+    Generate and save a plot of time-series subsequences similar to a target subsequence.
+
+    This wrapper expects a function named `plot_similar_series` to be present in a
+    helper module named `similarity_utils` (placed next to this app.py) and to accept the
+    same arguments below and *save* the figure to `filepath`.
+
+    Behavior:
+    - If `target_time` is a string, it will be converted with pandas.to_datetime.
+    - Attempts to import `plot_similar_series` from a local module `similarity_utils`.
+    - Calls it with (filepath, target_time, window, product, parameter).
+    - Verifies the output file exists and returns the filepath string on success.
+
+    Notes:
+    - Provide a file path that includes directories; parent directories must exist.
+    - If you don't have `similarity_utils.plot_similar_series` implemented, create it
+      in the same folder as this app. The wrapper will raise an informative ImportError.
+
+    Examples
+    --------
+    >>> save_similar_series_plot("out/plot1.png", "2024-09-01 17:00:00", 10, "製品0", "FlowRate_L_min")
+    'out/plot1.png'
+    """
+    pass
+
+
+# =========================
 # デフォルトの agent system prompts
 # =========================
 DEFAULT_AGENT_PROMPTS = {
@@ -84,6 +122,8 @@ DEFAULT_AGENT_PROMPTS = {
     "planner": (
         "あなたはプランナーです。ユーザ要求を満たすための実行計画を立てます。"
         "計画は必ず Python で実行可能な具体的な処理ステップとして、短い文のリストに分解してください。"
+        "使用可能なツール: save_similar_series_plot(filepath, target_time, window, product, parameter) が利用可能です。"
+        "もし時系列類似箇所を可視化する目的であれば、必ずこのツールを使う計画を出力してください。"
         "分解した各命令に対し、それぞれ独立した.pyファイルを作成して実行結果を取得することになります。"
         "外部ネットワークは行わないでください。"
     ),
@@ -99,7 +139,14 @@ DEFAULT_AGENT_PROMPTS = {
         "  IMAGE_SAVED: {image_path_str}\n"
         "- 画像保存後は plt.close() を呼んでください。\n"
         "- ファイル書き込みが不要な処理（単純な計算やテキスト出力）なら、通常通り print で結果を出してください。"
-        "コードは1つのコードブロックに入れてください。"
+        "コードは1つのコードブロックに入れてください。\n\n"
+        "補足 — 利用可能ツールの説明:\n"
+        "この実行環境にはツール `save_similar_series_plot(filepath, target_time, window, product, parameter)` が定義されています。"
+        "ツールは時系列類似区間の可視化を行い、指定した `filepath` に図を保存します。\n"
+        "Executor が図を作る場合は、以下のいずれかの方法で図を保存してください:\n"
+        "1) 直接 matplotlib を使って図を作り、savefig を呼ぶ（必ず IMAGE_SAVED: 行を出力）。\n"
+        "2) 既存のユーティリティを使う場合は `from app import save_similar_series_plot` をインポートして呼び出す。\n"
+        "   例: save_similar_series_plot('{image_path_str}', '2025-08-01 17:00:00', 10, '製品0', 'FlowRate')\n"
     ),
     "executor_2": "これまでの実行ログ:\n{previous_execs_text}",
     "summarizer_1": (
@@ -189,6 +236,9 @@ class AppState(TypedDict):
 
 # =========================
 # ノード実装（各所で session の agent_prompts を参照）
+# =========================
+
+
 def router_node(state: AppState) -> AppState:
     llm = get_llm("router", temperature=0.0)
     system_content = st.session_state.agent_prompts.get("router", DEFAULT_AGENT_PROMPTS["router"])
