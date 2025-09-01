@@ -1,8 +1,10 @@
 import datetime
+import logging
 import os
 import re
 import subprocess
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, TypedDict, Union
 
@@ -20,6 +22,42 @@ from langgraph.graph import END, StateGraph
 
 # --- LangChain / OpenAI ---
 from pydantic import BaseModel, Field
+
+# =========================
+# ロガー初期化 — ファイル出力（ローテート）
+# =========================
+# 環境変数でログディレクトリや回転設定を上書き可能
+log_dir = Path(os.getenv("LOG_DIR", "logs"))
+log_dir.mkdir(parents=True, exist_ok=True)
+log_file = log_dir / "llm_multi_agent.log"
+
+logger = logging.getLogger("llm_multi_agent")
+logger.setLevel(logging.INFO)
+# Streamlit のリロードでハンドラを重複して追加しないようにする
+if not logger.handlers:
+    # コンソールハンドラ（従来通り）
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(ch)
+
+    # RotatingFileHandler: maxBytes（デフォルト 5MB）, backupCount（デフォルト 3）
+    try:
+        max_bytes = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+        backup_count = int(os.getenv("LOG_BACKUP_COUNT", "3"))
+        fh = RotatingFileHandler(
+            filename=str(log_file),
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logger.addHandler(fh)
+    except Exception as e:
+        # ファイルハンドラの作成に失敗してもアプリは続行。コンソールへエラーを出す。
+        logger.error("Failed to create RotatingFileHandler: %s", e)
+
+    # ルートロガーへの伝播を止めて二重ログ化を避ける
+    logger.propagate = False
 
 # =========================
 # Env 読み込み & LLM Factory
@@ -73,80 +111,39 @@ def get_llm(agent: str, temperature: float = 0.2):
 
 
 # =========================
-# ツール実装: save_similar_series_plot
-# =========================
-
-
-def save_similar_series_plot(
-    filepath: str,
-    target_time: Union[str, datetime.datetime],
-    window: int,
-    product: str,
-    parameter: str,
-) -> None:
-    """
-    Generate and save a plot of time-series subsequences similar to a target subsequence.
-
-    This wrapper expects a function named `plot_similar_series` to be present in a
-    helper module named `similarity_utils` (placed next to this app.py) and to accept the
-    same arguments below and *save* the figure to `filepath`.
-
-    Behavior:
-    - If `target_time` is a string, it will be converted with pandas.to_datetime.
-    - Attempts to import `plot_similar_series` from a local module `similarity_utils`.
-    - Calls it with (filepath, target_time, window, product, parameter).
-    - Verifies the output file exists and returns the filepath string on success.
-
-    Notes:
-    - Provide a file path that includes directories; parent directories must exist.
-    - If you don't have `similarity_utils.plot_similar_series` implemented, create it
-      in the same folder as this app. The wrapper will raise an informative ImportError.
-
-    Examples
-    --------
-    >>> save_similar_series_plot("out/plot1.png", "2024-09-01 17:00:00", 10, "製品0", "FlowRate_L_min")
-    'out/plot1.png'
-    """
-    pass
-
-
-# =========================
 # デフォルトの agent system prompts
 # =========================
+tool_description = (
+    "利用可能なツール:\n"
+    "- tools.save_similar_series_plot(filepath: str, target_time: str | datetime.datetime, window: int, product: str, parameter: str) -> None\n"
+    "  指定した target_time を含む時系列部分系列と類似した区間を検索し、図を生成して filepath に保存する。\n"
+    "  target_time は文字列または datetime、window は直近データ点数、product は製品名、parameter はパラメータ名を指定。\n"
+)
+
 DEFAULT_AGENT_PROMPTS = {
     "router": (
         "あなたは入力が『通常の会話か/コードを書いて実行して結果を返すべきか』を判定する分類器です。"
-        "データ加工・計算・グラフ作成・シミュレーションなど、明らかに実行結果が必要な場合は run_code=True。"
-        "一般的なQA、考察、要約、ガイドは run_code=False とする。"
+        "データ加工・計算・グラフ作成・シミュレーションなど、実行結果が必要な場合は run_code=True。"
+        "一般的なQAや要約、説明は run_code=False。"
     ),
     "planner": (
-        "あなたはプランナーです。ユーザ要求を満たすための実行計画を立てます。"
-        "計画は必ず Python で実行可能な具体的な処理ステップとして、短い文のリストに分解してください。"
-        "使用可能なツール: save_similar_series_plot(filepath, target_time, window, product, parameter) が利用可能です。"
-        "もし時系列類似箇所を可視化する目的であれば、必ずこのツールを使う計画を出力してください。"
-        "分解した各命令に対し、それぞれ独立した.pyファイルを作成して実行結果を取得することになります。"
-        "外部ネットワークは行わないでください。"
+        "あなたはプランナーです。ユーザ要求を満たすための処理手順を、"
+        "実行可能なPythonステップに分解して短いリストで出力してください。\n\n"
+        f"{tool_description}\n"
+        "- 時系列類似箇所の可視化が目的なら必ず save_similar_series_plot を計画に含めてください。\n"
+        "- 各ステップは独立した .py ファイルとして実行されます。\n"
+        "- 外部ネットワークは使用しないでください。"
     ),
     "executor_1": (
-        "あなたはPythonコーダです。以下の『処理ステップ』を満たす最小の実行可能なPythonコードを"
-        "1つのコードブロックだけで出力してください。表示は print を用いてください。"
-        "外部ネットワークにはアクセスしないでください。"
-        "\n\n"
-        "重要（図の保存について）:\n"
-        "- もし図 (plot, figure, chart) を作るなら、必ず matplotlib 等の savefig を使って"
-        "  **'{image_path_str}'** に保存してください（絶対パス）。\n"
-        "- 保存した直後に、標準出力に以下の1行を必ず出力してください:"
-        "  IMAGE_SAVED: {image_path_str}\n"
-        "- 画像保存後は plt.close() を呼んでください。\n"
-        "- ファイル書き込みが不要な処理（単純な計算やテキスト出力）なら、通常通り print で結果を出してください。"
-        "コードは1つのコードブロックに入れてください。\n\n"
-        "補足 — 利用可能ツールの説明:\n"
-        "この実行環境にはツール `save_similar_series_plot(filepath, target_time, window, product, parameter)` が定義されています。"
-        "ツールは時系列類似区間の可視化を行い、指定した `filepath` に図を保存します。\n"
-        "Executor が図を作る場合は、以下のいずれかの方法で図を保存してください:\n"
-        "1) 直接 matplotlib を使って図を作り、savefig を呼ぶ（必ず IMAGE_SAVED: 行を出力）。\n"
-        "2) 既存のユーティリティを使う場合は `from app import save_similar_series_plot` をインポートして呼び出す。\n"
-        "   例: save_similar_series_plot('{image_path_str}', '2025-08-01 17:00:00', 10, '製品0', 'FlowRate')\n"
+        "あなたはPythonコーダです。与えられた処理ステップを満たす最小の実行可能コードを、"
+        "1つのコードブロックだけで出力してください。出力は print を用いてください。"
+        "ツール用モジュール tools は既にインポートされています。\n\n"
+        "図を生成する場合のルール:\n"
+        "- matplotlib 等で作成した場合、必ず '{image_path_str}' に保存し、"
+        "直後に `IMAGE_SAVED: {image_path_str}` を print してください。\n"
+        "- 保存後は plt.close() を呼んでください。\n"
+        "- 直接の計算やテキスト出力なら通常通り print を使ってください。\n\n"
+        f"{tool_description}"
     ),
     "executor_2": "これまでの実行ログ:\n{previous_execs_text}",
     "summarizer_1": (
@@ -156,14 +153,14 @@ DEFAULT_AGENT_PROMPTS = {
     "summarizer_2": "元の要求: {user_input}",
     "responder_chat": (
         "あなたは有能なアシスタントです。ユーザの質問に対して、"
-        "与えられた情報（直近の会話コンテキストを参考に）を元に、日本語で分かりやすく簡潔に回答してください。"
-        "必要なら箇条書きや具体例を用いて説明してください。出典提示は不要です。"
+        "与えられた情報を元に、日本語で分かりやすく簡潔に回答してください。"
+        "必要なら箇条書きや具体例を使っても構いません。"
     ),
     "responder_code_1": (
         "あなたは回答者です。ユーザの質問に対して、"
-        "与えられた情報（直近の会話コンテキストを参考に）を元に、日本語で分かりやすく簡潔に回答してください。"
-        "必要なら箇条書きや具体例を用いて説明してください。出典提示は不要です。"
-        "余計なメタ情報（実行ステップの詳細やソースコード等）は含めず、必要な部分だけ簡潔に伝えてください。"
+        "与えられた情報を元に日本語で簡潔に回答してください。"
+        "余計なメタ情報（実行ステップの詳細やソースコード等）は含めず、"
+        "必要な部分だけを伝えてください。"
     ),
     "responder_code_2": "# ユーザの質問:\n{user_input}\n\n# 分析結果:\n{summarizer_answer}",
 }
@@ -222,6 +219,39 @@ def get_recent_turn_messages(max_turns: int = 2) -> List[Any]:
     return messages
 
 
+# ログ出力フォーマッタ（Message オブジェクトを見やすくする）
+def _format_messages_for_log(msgs: List[Any]) -> str:
+    out_lines: List[str] = []
+    for m in msgs:
+        try:
+            role = m.__class__.__name__
+            content = getattr(m, "content", str(m))
+        except Exception:
+            role = "Unknown"
+            content = str(m)
+        out_lines.append(f"- {role}: {content}")
+    return "\n".join(out_lines) if out_lines else "(no messages)"
+
+
+# ログを統一して出すユーティリティ
+def log_agent_io(agent: str, input_data: Any, output_data: Any):
+    try:
+        if isinstance(input_data, (list, tuple)):
+            input_str = _format_messages_for_log(list(input_data))
+        else:
+            input_str = str(input_data)
+    except Exception:
+        input_str = repr(input_data)
+
+    try:
+        output_str = str(output_data)
+    except Exception:
+        output_str = repr(output_data)
+
+    logger.info("=== %s INPUT ===\n%s", agent, input_str)
+    logger.info("=== %s OUTPUT ===\n%s", agent, output_str)
+
+
 # =========================
 # LangGraph の State 定義
 # =========================
@@ -237,8 +267,6 @@ class AppState(TypedDict):
 # =========================
 # ノード実装（各所で session の agent_prompts を参照）
 # =========================
-
-
 def router_node(state: AppState) -> AppState:
     llm = get_llm("router", temperature=0.0)
     system_content = st.session_state.agent_prompts.get("router", DEFAULT_AGENT_PROMPTS["router"])
@@ -247,7 +275,16 @@ def router_node(state: AppState) -> AppState:
     recent_msgs = get_recent_turn_messages(max_turns=2)
     messages = [system] + recent_msgs + [HumanMessage(content=state["user_input"])]
 
+    # ログ出力（input）
+    log_agent_io("Router", messages, "invoking LLM for decision")
+
     decision = llm.with_structured_output(RouterDecision).invoke(messages)
+
+    # ログ出力（output）
+    log_agent_io(
+        "Router", "(invocation)", f"run_code={decision.run_code} / reason={decision.reason}"
+    )
+
     mode: Literal["chat", "code"] = "code" if decision.run_code else "chat"
     log = {"agent": "Router", "output": f"run_code={decision.run_code} / reason={decision.reason}"}
     return {
@@ -267,12 +304,22 @@ def planner_node(state: AppState) -> AppState:
     system = SystemMessage(content=system_content)
 
     recent_msgs = get_recent_turn_messages(max_turns=1)
+
+    # ログ（input: recent history + user input）
+    planner_input_msgs = (
+        [system] + recent_msgs + [HumanMessage(content=state.get("user_input", ""))]
+    )
+    log_agent_io("Planner", planner_input_msgs, "invoking LLM to create plan")
+
     decision: Plan = llm.with_structured_output(Plan).invoke(
         [system] + recent_msgs + [HumanMessage(content=state["user_input"])]
     )
 
     steps = decision.steps
     log = {"agent": "Planner", "output": "\n".join(f"- {s}" for s in steps)}
+
+    # ログ（output: steps）
+    log_agent_io("Planner", "(invocation)", steps)
 
     return {**state, "plan": steps, "agent_logs": state["agent_logs"] + [log]}
 
@@ -331,7 +378,20 @@ def executor_node(
             + [HumanMessage(content=step)]
         )
 
+        # ログ（Executor-step: input: step, recent messages, previous execs）
+        executor_input_summary = {
+            "step_index": i,
+            "step": step,
+            "recent_messages": _format_messages_for_log(recent_msgs),
+            "previous_execs": previous_execs_text[:4000],
+        }
+        log_agent_io(f"Executor-Step-{i}", executor_input_summary, "invoking executor LLM")
+
         code_text = llm.invoke(messages).content
+
+        # ログ（生成コード）
+        log_agent_io(f"Executor-Step-{i}", "(invocation)", code_text[:4000])
+
         code_blocks = _extract_code_blocks(code_text)
 
         if not code_blocks:
@@ -343,12 +403,22 @@ def executor_node(
 
         code = code_blocks[0]
 
+        # 先頭に必要なimport文を追記
+        code = (
+            "import sys\n"
+            "import os\n"
+            "CURDIR = os.path.dirname(os.path.abspath(__file__))\n"
+            "sys.path.append(os.path.join(CURDIR, '..'))\n"
+            "from libs import tools\n"
+        ) + code
+
         file_path = tmp_dir / f"step_{i}.py"
         file_path.write_text(code, encoding="utf-8")
 
         prior_files = set(tmp_dir.iterdir())
 
         try:
+            # 40秒タイムアウト、標準出力・標準エラーをキャプチャ
             result = subprocess.run(
                 [sys.executable, str(file_path)],
                 capture_output=True,
@@ -366,6 +436,9 @@ def executor_node(
             exec_report_str = (
                 f"[Step {i}] 実行エラー: {e}\n--- file ---\n{file_path}\n--- code ---\n{code}"
             )
+
+        # ログ（実行結果）
+        log_agent_io(f"Executor-Step-{i}", "(execution)", {"stdout": out, "stderr": err})
 
         images: List[str] = []
         try:
@@ -400,12 +473,18 @@ def executor_node(
     if images_accum:
         log["images"] = images_accum
 
+    # Executor 全体ログ出力
+    log_agent_io("Executor", "(all executions)", executions[:4000])
+
     return {**state, "executions": executions, "agent_logs": state["agent_logs"] + [log]}
 
 
 def summarizer_node(state: AppState) -> AppState:
     llm = get_llm("summarizer", temperature=0.3)
     joined = "\n\n".join(state.get("executions") or [])
+
+    # ログ（input: 全実行ログ）
+    log_agent_io("Summarizer", joined[:4000], "invoking summarizer")
 
     system_content = st.session_state.agent_prompts.get(
         "summarizer_1", DEFAULT_AGENT_PROMPTS["summarizer_1"]
@@ -427,6 +506,10 @@ def summarizer_node(state: AppState) -> AppState:
     )
 
     answer = llm.invoke(messages).content
+
+    # ログ（output: summary）
+    log_agent_io("Summarizer", "(invocation)", answer)
+
     log = {"agent": "Summarizer", "output": answer}
     return {**state, "answer": answer, "agent_logs": state["agent_logs"] + [log]}
 
@@ -442,6 +525,10 @@ def responder_node(state: AppState) -> AppState:
         system = SystemMessage(content=system_content)
         payload = state.get("user_input", "").strip()
         recent_msgs = get_recent_turn_messages(max_turns=3)
+
+        # ログ（input: recent history + payload）
+        responder_input = [system] + recent_msgs + [HumanMessage(content=payload)]
+        log_agent_io("Responder(chat)", responder_input, "invoking responder LLM")
     else:
         system_content = st.session_state.agent_prompts.get(
             "responder_code_1", DEFAULT_AGENT_PROMPTS["responder_code_1"]
@@ -456,8 +543,15 @@ def responder_node(state: AppState) -> AppState:
         payload = system_content.format(user_input=user_input, summarizer_answer=summarizer_answer)
         recent_msgs = get_recent_turn_messages(max_turns=1)
 
+        # ログ（input: user_input + summarizer）
+        responder_input = [system] + recent_msgs + [HumanMessage(content=payload or "")]
+        log_agent_io("Responder(code)", responder_input, "invoking responder LLM")
+
     messages = [system] + recent_msgs + [HumanMessage(content=payload or "")]
     final_answer = generation_llm.invoke(messages).content
+
+    # ログ（output: final answer）
+    log_agent_io("Responder", "(invocation)", final_answer)
 
     log = {"agent": f"Responder(mode={mode})", "output": final_answer}
     return {**state, "answer": final_answer, "agent_logs": state["agent_logs"] + [log]}
